@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -35,6 +36,13 @@ def _make_sd3_pipeline():
     pipeline.default_sample_size = 128
     pipeline.transformer = SimpleNamespace(in_channels=1)
     return pipeline
+
+
+def _make_pretrained_stub():
+    stub = MagicMock()
+    stub.config = SimpleNamespace(block_out_channels=[1, 2, 4])
+    stub.to.return_value = stub
+    return stub
 
 
 def test_forward_collates_request_prompt_tensors_for_sd3():
@@ -153,3 +161,58 @@ def test_encode_prompt_preserves_direct_pooled_prompt_embeds():
 
     assert actual_prompt_embeds is prompt_embeds
     assert actual_pooled_prompt_embeds is pooled_prompt_embeds
+
+
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.prefetch_subfolders",
+)
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.from_pretrained_with_prefetch",
+)
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.T5Tokenizer.from_pretrained",
+    return_value=MagicMock(),
+)
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.CLIPTokenizer.from_pretrained",
+    return_value=MagicMock(),
+)
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.FlowMatchEulerDiscreteScheduler.from_pretrained",
+    return_value=MagicMock(),
+)
+@patch(
+    "vllm_omni.diffusion.models.sd3.pipeline_sd3.get_local_device",
+    return_value="cpu",
+)
+def test_sd3_pipeline_passes_quant_config_to_transformer(
+    _mock_get_local_device,
+    _mock_scheduler,
+    _mock_clip_tokenizer,
+    _mock_t5_tokenizer,
+    mock_from_pretrained,
+    _mock_prefetch,
+):
+    captured_kwargs = {}
+
+    class FakeTransformer:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    mock_from_pretrained.side_effect = lambda *args, **kwargs: _make_pretrained_stub()
+
+    with patch("vllm_omni.diffusion.models.sd3.pipeline_sd3.SD3Transformer2DModel", FakeTransformer):
+        fake_quant_config = MagicMock()
+        od_config = SimpleNamespace(
+            model="fake-sd3-model",
+            dtype=torch.bfloat16,
+            tf_model_config=SimpleNamespace(),
+            quantization_config=fake_quant_config,
+            output_type="pil",
+            enable_diffusion_pipeline_profiler=False,
+        )
+
+        StableDiffusion3Pipeline(od_config=od_config)
+
+    assert captured_kwargs["od_config"] is od_config
+    assert captured_kwargs["quant_config"] is fake_quant_config
