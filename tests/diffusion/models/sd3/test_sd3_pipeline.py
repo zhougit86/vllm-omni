@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.models.sd3.sd3_transformer as sd3_transformer
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -43,6 +44,55 @@ def _make_pretrained_stub():
     stub.config = SimpleNamespace(block_out_channels=[1, 2, 4])
     stub.to.return_value = stub
     return stub
+
+
+def _make_sd3_model_config(**overrides):
+    values = {
+        "num_layers": 2,
+        "sample_size": 32,
+        "in_channels": 16,
+        "out_channels": 16,
+        "num_attention_heads": 2,
+        "attention_head_dim": 4,
+        "caption_projection_dim": 8,
+        "pooled_projection_dim": 8,
+        "joint_attention_dim": 8,
+        "patch_size": 2,
+        "dual_attention_layers": (),
+        "qk_norm": "rms_norm",
+        "pos_embed_max_size": 32,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _make_fake_linear(records, kind):
+    class _FakeLinear(nn.Module):
+        def __init__(self, *args, quant_config=None, prefix="", total_num_heads=None, **kwargs):
+            super().__init__()
+            records.append(
+                {
+                    "kind": kind,
+                    "quant_config": quant_config,
+                    "prefix": prefix,
+                }
+            )
+            self.quant_config = quant_config
+            self.prefix = prefix
+            self.num_heads = total_num_heads or kwargs.get("total_num_heads") or 1
+
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states, None
+
+    return _FakeLinear
+
+
+class _FakeAttention(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, *args, **kwargs):
+        raise AssertionError("attention forward should not be called during constructor-only tests")
 
 
 def test_forward_collates_request_prompt_tensors_for_sd3():
@@ -216,3 +266,40 @@ def test_sd3_pipeline_passes_quant_config_to_transformer(
 
     assert captured_kwargs["od_config"] is od_config
     assert captured_kwargs["quant_config"] is fake_quant_config
+
+
+def test_sd3_transformer_propagates_quant_config_to_key_submodules():
+    records = []
+    fake_quant_config = MagicMock(name="fake_quant_config")
+    od_config = SimpleNamespace(
+        tf_model_config=_make_sd3_model_config(),
+        parallel_config=SimpleNamespace(),
+        quantization_config=fake_quant_config,
+    )
+
+    with (
+        patch.object(sd3_transformer, "QKVParallelLinear", _make_fake_linear(records, "qkv")),
+        patch.object(sd3_transformer, "RowParallelLinear", _make_fake_linear(records, "row")),
+        patch.object(sd3_transformer, "ColumnParallelLinear", _make_fake_linear(records, "column")),
+        patch.object(sd3_transformer, "ReplicatedLinear", _make_fake_linear(records, "replicated")),
+        patch.object(sd3_transformer, "Attention", _FakeAttention),
+    ):
+        sd3_transformer.SD3Transformer2DModel(od_config=od_config, quant_config=fake_quant_config)
+
+    record_by_prefix = {item["prefix"]: item for item in records}
+    expected_prefixes = {
+        "context_embedder",
+        "transformer_blocks.0.attn.to_qkv",
+        "transformer_blocks.0.attn.add_kv_proj",
+        "transformer_blocks.0.attn.to_out.0",
+        "transformer_blocks.0.attn.to_add_out",
+        "transformer_blocks.0.ff.net.0.proj",
+        "transformer_blocks.0.ff.net.2",
+        "transformer_blocks.0.ff_context.net.0.proj",
+        "transformer_blocks.0.ff_context.net.2",
+        "proj_out",
+    }
+
+    assert expected_prefixes <= set(record_by_prefix)
+    for prefix in expected_prefixes:
+        assert record_by_prefix[prefix]["quant_config"] is fake_quant_config
